@@ -160,6 +160,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistory))
+	p.mux.HandleFunc("GET /panel/api/balance_history", p.withAuth(p.balanceHistory))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
@@ -412,6 +413,170 @@ func (p *Panel) nicknames() map[string]string {
 		}
 	}
 	return nicks
+}
+
+// realms 池内 uid → 域（cn/global）映射（仅展示用）。
+func (p *Panel) realms() map[string]string {
+	out := map[string]string{}
+	if p.cfg.Pool == nil {
+		return out
+	}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Realm != "" {
+			out[s.UID] = s.Realm
+		}
+	}
+	return out
+}
+
+// dailyAgg 每日余额汇总（余额趋势里把流水按自然日折叠）。
+type dailyAgg struct {
+	first, last, change, consumed, gained int64
+}
+
+// balanceHistory 余额趋势：每个账号的余额观测点（points）+ 每日汇总（daily）。
+//
+// 数据来自积分账本（credithist）：账本把「每次真实查到的余额」与上一次比对留痕，
+// 所以 points 是余额变化观测点（非严格等间隔快照）。首次见到账号只建基线、不记流水，
+// 因此新账号在第一次余额变化前没有点——这是预期行为，不是缺数据。
+func (p *Panel) balanceHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.CreditHistory == nil {
+		writeErr(w, http.StatusNotImplemented, "balance history not available")
+		return
+	}
+	days := 7
+	if v := r.URL.Query().Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 365 {
+			days = n
+		}
+	}
+	nicks := p.nicknames()
+	realms := p.realms()
+	snapshot := p.cfg.CreditHistory.Snapshot()
+	entries := p.cfg.CreditHistory.Read(0) // 新的在前
+
+	// 按 uid 分组，恢复时间升序（Read 返回新的在前）。
+	byUID := map[string][]credithist.Entry{}
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		byUID[e.UID] = append(byUID[e.UID], e)
+	}
+
+	cutoff := time.Now().AddDate(0, 0, -days)
+
+	uids := make([]string, 0, len(byUID))
+	for uid := range byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+
+	series := make([]map[string]any, 0, len(uids))
+	for _, uid := range uids {
+		list := byUID[uid]
+		cur, hasCur := snapshot[uid]
+		if !hasCur && len(list) > 0 {
+			cur = list[len(list)-1].After
+			hasCur = true
+		}
+
+		points := make([]map[string]any, 0, len(list)+1)
+		dailyMap := map[string]*dailyAgg{}
+		var minV, maxV, firstV int64
+		havePoint := false
+
+		for _, e := range list {
+			if e.Time.Before(cutoff) {
+				continue
+			}
+			points = append(points, map[string]any{
+				"t": e.Time.Unix(),
+				"u": uid,
+				"c": e.After,
+			})
+			if !havePoint {
+				firstV = e.Before
+				minV, maxV = e.After, e.After
+				havePoint = true
+			} else {
+				if e.After < minV {
+					minV = e.After
+				}
+				if e.After > maxV {
+					maxV = e.After
+				}
+			}
+			day := e.Time.Format("2006-01-02")
+			d := dailyMap[day]
+			if d == nil {
+				d = &dailyAgg{first: e.Before}
+				dailyMap[day] = d
+			}
+			d.last = e.After
+			d.change += e.Delta
+			if e.Delta < 0 {
+				d.consumed += -e.Delta
+			} else {
+				d.gained += e.Delta
+			}
+		}
+
+		// 当前基线补为最后一个点：本窗口内无流水，或最新流水之后余额又变过。
+		if hasCur {
+			if !havePoint {
+				points = append(points, map[string]any{"t": time.Now().Unix(), "u": uid, "c": cur})
+				minV, maxV, firstV = cur, cur, cur
+				havePoint = true
+			} else if list[len(list)-1].After != cur {
+				points = append(points, map[string]any{"t": time.Now().Unix(), "u": uid, "c": cur})
+				if cur < minV {
+					minV = cur
+				}
+				if cur > maxV {
+					maxV = cur
+				}
+			}
+		}
+
+		dayKeys := make([]string, 0, len(dailyMap))
+		for d := range dailyMap {
+			dayKeys = append(dayKeys, d)
+		}
+		sort.Strings(dayKeys)
+		daily := make([]map[string]any, 0, len(dayKeys))
+		for _, d := range dayKeys {
+			a := dailyMap[d]
+			daily = append(daily, map[string]any{
+				"day":      d,
+				"first":    a.first,
+				"last":     a.last,
+				"change":   a.change,
+				"consumed": a.consumed,
+				"gained":   a.gained,
+			})
+		}
+
+		change := int64(0)
+		if havePoint {
+			change = cur - firstV
+		}
+		series = append(series, map[string]any{
+			"uid":     uid,
+			"name":    nicks[uid],
+			"points":  points,
+			"current": cur,
+			"min":     minV,
+			"max":     maxV,
+			"change":  change,
+			"daily":   daily,
+			"realm":   realms[uid],
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"days":   days,
+		"now":    time.Now().Format(time.RFC3339),
+		"series": series,
+	})
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：

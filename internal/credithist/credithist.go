@@ -173,6 +173,21 @@ func (l *Ledger) Read(limit int) []Entry {
 	return out
 }
 
+// Snapshot 返回当前余额基线副本（uid → 最近一次观测到的余额绝对值）。
+// 供余额趋势接口把「流水」与「当前基线」拼成时间线。
+func (l *Ledger) Snapshot() map[string]int64 {
+	if l == nil {
+		return map[string]int64{}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]int64, len(l.snapshot))
+	for k, v := range l.snapshot {
+		out[k] = v
+	}
+	return out
+}
+
 // write 原子写盘（临时文件 + rename，与 usage.Recorder 同口径）。失败只记日志：
 // 留痕是旁路观测，不能反过来影响余额刷新主流程。
 func (l *Ledger) write(raw []byte) {
