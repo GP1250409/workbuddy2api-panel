@@ -464,8 +464,17 @@ func (p *Panel) balanceHistory(w http.ResponseWriter, r *http.Request) {
 
 	cutoff := time.Now().AddDate(0, 0, -days)
 
-	uids := make([]string, 0, len(byUID))
+	// 有流水或至少有余额基线的账号都进入 series（新账号首次观测只建基线、无流水，
+	// 也要给一个当前余额点，否则页面会误判成「没有账号」）。
+	uidSet := map[string]bool{}
 	for uid := range byUID {
+		uidSet[uid] = true
+	}
+	for uid := range snapshot {
+		uidSet[uid] = true
+	}
+	uids := make([]string, 0, len(uidSet))
+	for uid := range uidSet {
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
